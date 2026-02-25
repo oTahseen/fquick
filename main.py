@@ -27,6 +27,11 @@ if not BOT_TOKEN:
 
 SQLITE_PATH = os.environ.get("SQLITE_PATH", "mquick.db")
 
+# Tunables (env)
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "200"))  # global cap
+PER_TOKEN_CONCURRENCY = int(os.environ.get("PER_TOKEN_CONCURRENCY", "10"))  # per token cap
+CONFIG_POLL_INTERVAL = float(os.environ.get("CONFIG_POLL_INTERVAL", "2.0"))  # seconds between config refresh per loop
+
 user_tokens = {}
 matching_tasks = {}
 user_stats = {}
@@ -34,8 +39,15 @@ task_meta = {}
 
 sql_db = None
 
+# concurrency primitives
+global_req_sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)  # cap across all tokens
+db_lock = asyncio.Lock()  # serialize DB writes to reduce SQLITE_BUSY
+
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
+
+# Reuse connector across sessions to save resources
+GLOBAL_CONNECTOR = aiohttp.TCPConnector(ssl=False, limit_per_host=20)
 
 HEADERS_TEMPLATE = {
     "User-Agent": "okhttp/5.1.0 (Linux; Android 13; Pixel 6 Build/TQ3A.230901.001)",
@@ -84,16 +96,19 @@ async def init_db():
     await sql_db.commit()
 
 async def get_config_value(key):
+    # reads are cheap; if needed we could add an in-memory cache at a higher level
     async with sql_db.execute("SELECT value FROM config WHERE key = ?", (key,)) as cur:
         row = await cur.fetchone()
         return row[0] if row else None
 
 async def set_config_value(key, value):
-    await sql_db.execute(
-        "INSERT INTO config(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value),
-    )
-    await sql_db.commit()
+    # serialize writes to reduce contention
+    async with db_lock:
+        await sql_db.execute(
+            "INSERT INTO config(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        await sql_db.commit()
 
 async def get_config_bool(key, default=False):
     v = await get_config_value(key)
@@ -110,33 +125,42 @@ async def list_excluded_countries(chat_id):
         return [r[0] for r in rows]
 
 async def add_excluded_countries(chat_id, countries):
-    async with sql_db.execute("BEGIN"):
+    # batch insert inside a single transaction; protect with db_lock to avoid concurrent writers
+    async with db_lock:
+        await sql_db.execute("BEGIN")
         for c in countries:
             await sql_db.execute(
                 "INSERT OR IGNORE INTO exclude(chat_id, country) VALUES(?, ?)",
                 (chat_id, c),
             )
-    await sql_db.commit()
+        await sql_db.commit()
 
 async def clear_excluded_countries(chat_id):
-    await sql_db.execute("DELETE FROM exclude WHERE chat_id = ?", (chat_id,))
-    await sql_db.commit()
+    async with db_lock:
+        await sql_db.execute("DELETE FROM exclude WHERE chat_id = ?", (chat_id,))
+        await sql_db.commit()
 
 async def reserve_user(user_id, chat_id):
     now = datetime.utcnow().isoformat()
     try:
-        await sql_db.execute(
-            "INSERT INTO history(user_id, chat_id, first_added_at, reserved) VALUES(?, ?, ?, 1)",
-            (user_id, chat_id, now),
-        )
-        await sql_db.commit()
+        async with db_lock:
+            await sql_db.execute(
+                "INSERT INTO history(user_id, chat_id, first_added_at, reserved) VALUES(?, ?, ?, 1)",
+                (user_id, chat_id, now),
+            )
+            await sql_db.commit()
         return True
     except sqlite3.IntegrityError:
+        # already exists, treat as reserved previously
+        return False
+    except Exception:
+        # any other DB error: fail-safe to not block matching
         return False
 
 async def mark_user_added(user_id, chat_id):
-    async with sql_db.execute("SELECT reserved FROM history WHERE user_id = ? AND chat_id = ?", (user_id, chat_id)) as cur:
-        row = await cur.fetchone()
+    async with db_lock:
+        async with sql_db.execute("SELECT reserved FROM history WHERE user_id = ? AND chat_id = ?", (user_id, chat_id)) as cur:
+            row = await cur.fetchone()
         if not row:
             now = datetime.utcnow().isoformat()
             await sql_db.execute(
@@ -145,12 +169,13 @@ async def mark_user_added(user_id, chat_id):
             )
             await sql_db.commit()
             return
-    await sql_db.execute("UPDATE history SET reserved = 0 WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
-    await sql_db.commit()
+        await sql_db.execute("UPDATE history SET reserved = 0 WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
+        await sql_db.commit()
 
 async def unreserve_user_on_failure(user_id, chat_id):
-    await sql_db.execute("DELETE FROM history WHERE user_id = ? AND chat_id = ? AND reserved = 1", (user_id, chat_id))
-    await sql_db.commit()
+    async with db_lock:
+        await sql_db.execute("DELETE FROM history WHERE user_id = ? AND chat_id = ? AND reserved = 1", (user_id, chat_id))
+        await sql_db.commit()
 
 async def history_for_chat(chat_id, limit=20):
     async with sql_db.execute(
@@ -171,24 +196,31 @@ async def history_total_count():
         return row[0] if row else 0
 
 async def clear_history_for_chat(chat_id):
-    await sql_db.execute("DELETE FROM history WHERE chat_id = ?", (chat_id,))
-    await sql_db.commit()
+    async with db_lock:
+        await sql_db.execute("DELETE FROM history WHERE chat_id = ?", (chat_id,))
+        await sql_db.commit()
 
 async def clear_all_history():
-    await sql_db.execute("DELETE FROM history")
-    await sql_db.commit()
+    async with db_lock:
+        await sql_db.execute("DELETE FROM history")
+        await sql_db.commit()
 
 async def fetch_users(session, explore_url):
-    async with session.get(explore_url) as res:
-        status = res.status
-        text = await res.text()
-        if status != 200:
-            return status, text, None
-        try:
-            data = await res.json(content_type=None)
-        except:
-            return status, text, None
-        return status, text, data
+    try:
+        async with session.get(explore_url) as res:
+            status = res.status
+            text = await res.text()
+            if status != 200:
+                return status, text, None
+            try:
+                data = await res.json(content_type=None)
+            except Exception:
+                return status, text, None
+            return status, text, data
+    except asyncio.TimeoutError:
+        return 504, "timeout", None
+    except Exception as e:
+        return 500, str(e), None
 
 async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboard):
     key = f"{chat_id}:{token}"
@@ -197,60 +229,108 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
     stats = {"requests": 0, "cycles": 0, "errors": 0}
     user_stats[key] = stats
     timeout = aiohttp.ClientTimeout(total=30)
-    connector = aiohttp.TCPConnector(ssl=False, limit_per_host=10)
+
     empty_count = 0
     stop_reason = None
+
+    # per-token semaphore to limit concurrency per token
+    per_token_sem = asyncio.Semaphore(PER_TOKEN_CONCURRENCY)
+
+    last_config_refresh = 0
+    countries_enabled = True
+    countries_mode = "exclude"
+    countries_list = set()
+
     try:
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
+        # reuse connector but create session per token (headers differ)
+        async with aiohttp.ClientSession(timeout=timeout, connector=GLOBAL_CONNECTOR, headers=headers) as session:
             async def answer_user(user_id):
                 nonlocal stop_reason
+                # Acquire both global and per-token semaphores to keep concurrency bounded
                 try:
-                    async with session.get(ANSWER_URL.format(user_id=user_id)) as res:
-                        text = await res.text()
-                        if res.status == 429 or "LikeExceeded" in text:
-                            stop_reason = "LIMIT EXCEEDED"
-                            await unreserve_user_on_failure(user_id, chat_id)
-                            return False
-                        if res.status == 401 or "AuthRequired" in text:
-                            stop_reason = "TOKEN EXPIRED"
-                            await unreserve_user_on_failure(user_id, chat_id)
-                            return False
-                        if res.status == 200:
-                            await mark_user_added(user_id, chat_id)
-                        else:
-                            await unreserve_user_on_failure(user_id, chat_id)
-                        return True
+                    await global_req_sem.acquire()
+                    await per_token_sem.acquire()
                 except Exception:
-                    stats["errors"] += 1
+                    return True  # don't stop overall run for semaphore issues
+                try:
                     try:
-                        await unreserve_user_on_failure(user_id, chat_id)
-                    except:
+                        async with session.get(ANSWER_URL.format(user_id=user_id)) as res:
+                            text = await res.text()
+                            if res.status == 429 or "LikeExceeded" in text:
+                                stop_reason = "LIMIT EXCEEDED"
+                                # unreserve on failure
+                                try:
+                                    await unreserve_user_on_failure(user_id, chat_id)
+                                except:
+                                    pass
+                                return False
+                            if res.status == 401 or "AuthRequired" in text:
+                                stop_reason = "TOKEN EXPIRED"
+                                try:
+                                    await unreserve_user_on_failure(user_id, chat_id)
+                                except:
+                                    pass
+                                return False
+                            if res.status == 200:
+                                try:
+                                    await mark_user_added(user_id, chat_id)
+                                except Exception:
+                                    # don't block if DB fails
+                                    pass
+                            else:
+                                try:
+                                    await unreserve_user_on_failure(user_id, chat_id)
+                                except:
+                                    pass
+                            return True
+                    except Exception:
+                        stats["errors"] += 1
+                        try:
+                            await unreserve_user_on_failure(user_id, chat_id)
+                        except:
+                            pass
+                        return True
+                finally:
+                    # Always release semaphores
+                    try:
+                        per_token_sem.release()
+                    except Exception:
                         pass
-                    return True
+                    try:
+                        global_req_sem.release()
+                    except Exception:
+                        pass
 
             while task_meta.get(task_id) and task_meta[task_id].get("running", True):
-                try:
-                    countries_enabled = await get_config_bool(f"countries_enabled:{chat_id}", default=True)
-                except Exception:
-                    countries_enabled = True
-                try:
-                    countries_mode = (await get_config_value(f"countries_mode:{chat_id}")) or "exclude"
-                except Exception:
-                    countries_mode = "exclude"
-                try:
-                    countries_list = set([c.upper() for c in await list_excluded_countries(chat_id)])
-                except Exception:
-                    countries_list = set()
+                # refresh config periodically instead of every loop to reduce DB pressure
+                now = asyncio.get_event_loop().time()
+                if now - last_config_refresh >= CONFIG_POLL_INTERVAL:
+                    last_config_refresh = now
+                    try:
+                        countries_enabled = await get_config_bool(f"countries_enabled:{chat_id}", default=True)
+                    except Exception:
+                        countries_enabled = True
+                    try:
+                        countries_mode = (await get_config_value(f"countries_mode:{chat_id}")) or "exclude"
+                    except Exception:
+                        countries_mode = "exclude"
+                    try:
+                        countries_list = set([c.upper() for c in await list_excluded_countries(chat_id)])
+                    except Exception:
+                        countries_list = set()
+
                 status, raw_text, data = await fetch_users(session, explore_url)
                 if status == 401 or "AuthRequired" in str(raw_text):
                     stop_reason = "TOKEN EXPIRED"
                     break
                 if data is None or not data.get("users"):
                     empty_count += 1
+                    # progressive backoff: increase sleep time when results are empty repeatedly
+                    backoff = min(2.0 + empty_count * 0.5, 6.0)
                     if empty_count >= 6:
                         stop_reason = "NO USERS FOUND"
                         break
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(backoff)
                     continue
                 empty_count = 0
                 users = data.get("users", [])
@@ -279,18 +359,22 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
                         reserved = await reserve_user(user_id, chat_id)
                     if not reserved:
                         continue
+                    # create task for each user answer, but concurrency limited by per_token_sem & global_req_sem
                     task = asyncio.create_task(answer_user(user_id))
                     tasks.append(task)
                     stats["requests"] += 1
-                    await asyncio.sleep(random.uniform(0.05, 0.2))
-                    if len(tasks) >= 10:
-                        batch_results = await asyncio.gather(*tasks)
+                    # small jitter to avoid bursty requests
+                    await asyncio.sleep(random.uniform(0.05, 0.12))
+                    # batch wait if we reached per-token concurrency threshold
+                    if len(tasks) >= PER_TOKEN_CONCURRENCY:
+                        batch_results = await asyncio.gather(*tasks, return_exceptions=False)
                         results.extend(batch_results)
                         tasks.clear()
+                        # if any returned False, stop reason triggered (limit / token expired)
                         if False in batch_results:
                             break
                 if tasks:
-                    batch_results = await asyncio.gather(*tasks)
+                    batch_results = await asyncio.gather(*tasks, return_exceptions=False)
                     results.extend(batch_results)
                 if False in results:
                     break
@@ -305,9 +389,11 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
                     final_text += f"\n\n⚠️ {stop_reason}"
                 try:
                     await stat_msg.edit_text(final_text, reply_markup=keyboard)
-                except:
+                except Exception:
+                    # don't block main loop if editing fails
                     pass
-                await asyncio.sleep(random.uniform(1, 2))
+                # small sleep to yield and avoid tight loop
+                await asyncio.sleep(random.uniform(0.8, 1.6))
     except asyncio.CancelledError:
         try:
             await stat_msg.edit_text(
