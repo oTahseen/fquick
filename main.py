@@ -70,7 +70,6 @@ async def init_db():
         );
         """
     )
-    # History is now per chat: (user_id, chat_id) is the primary key
     await sql_db.execute(
         """
         CREATE TABLE IF NOT EXISTS history (
@@ -123,7 +122,6 @@ async def clear_excluded_countries(chat_id):
     await sql_db.execute("DELETE FROM exclude WHERE chat_id = ?", (chat_id,))
     await sql_db.commit()
 
-# Reserve a user for a specific chat. Returns True if reserved, False if already reserved for that chat.
 async def reserve_user(user_id, chat_id):
     now = datetime.utcnow().isoformat()
     try:
@@ -134,11 +132,8 @@ async def reserve_user(user_id, chat_id):
         await sql_db.commit()
         return True
     except sqlite3.IntegrityError:
-        # Already present for this chat
-        # If row exists but reserved is 0, treat as not reserved (we don't reserve again)
         return False
 
-# Mark a user as added for a specific chat (clears reserved flag or inserts record if missing)
 async def mark_user_added(user_id, chat_id):
     async with sql_db.execute("SELECT reserved FROM history WHERE user_id = ? AND chat_id = ?", (user_id, chat_id)) as cur:
         row = await cur.fetchone()
@@ -153,7 +148,6 @@ async def mark_user_added(user_id, chat_id):
     await sql_db.execute("UPDATE history SET reserved = 0 WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
     await sql_db.commit()
 
-# Unreserve only for the specific chat
 async def unreserve_user_on_failure(user_id, chat_id):
     await sql_db.execute("DELETE FROM history WHERE user_id = ? AND chat_id = ? AND reserved = 1", (user_id, chat_id))
     await sql_db.commit()
@@ -171,7 +165,6 @@ async def history_count_for_chat(chat_id):
         row = await cur.fetchone()
         return row[0] if row else 0
 
-# Kept for compatibility but note: this returns total across all chats (not used in UI anymore)
 async def history_total_count():
     async with sql_db.execute("SELECT COUNT(*) FROM history") as cur:
         row = await cur.fetchone()
@@ -451,7 +444,6 @@ async def _hist_toggle(callback: CallbackQuery):
     current = await get_config_bool(f"history_enabled:{chat_id}", default=True)
     new = not current
     await set_config_bool(f"history_enabled:{chat_id}", new)
-    # Only show per-chat count now
     count = await history_count_for_chat(chat_id)
     state = "ON" if new else "OFF"
     text = f"History ({state}):\nYour saved ids: {count}"
@@ -476,7 +468,6 @@ async def _hist_clear(callback: CallbackQuery):
     except:
         await callback.answer("Invalid chat id", show_alert=False)
         return
-    # Clear only this chat's history
     await clear_history_for_chat(chat_id)
     await set_config_bool(f"history_enabled:{chat_id}", True)
     count = await history_count_for_chat(chat_id)
@@ -532,7 +523,6 @@ async def history_cmd(message):
     parts = message.text.split(maxsplit=1)
     args = parts[1].strip() if len(parts) > 1 else ""
     if not args:
-        # Only show per-chat stats
         count = await history_count_for_chat(chat_id)
         enabled = await get_config_bool(f"history_enabled:{chat_id}", default=True)
         state = "ON" if enabled else "OFF"
