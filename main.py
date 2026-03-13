@@ -543,9 +543,7 @@ async def history_cmd(message):
 
 @dp.message(Command("restart"))
 async def restart_cmd(message):
-    # Inform user we are restarting
-    await message.answer("Restarting bot: stopping tasks and restarting process...")
-    # Stop and cancel all matching tasks
+    await message.answer("Restarting...")
     for key, task in list(matching_tasks.items()):
         try:
             task.cancel()
@@ -553,7 +551,6 @@ async def restart_cmd(message):
             pass
     matching_tasks.clear()
     user_stats.clear()
-    # mark tasks as not running
     for tid, meta in list(task_meta.items()):
         try:
             meta["running"] = False
@@ -561,13 +558,11 @@ async def restart_cmd(message):
             pass
     task_meta.clear()
     user_tokens.clear()
-    # attempt to close DB
     try:
         if sql_db:
             await sql_db.close()
     except:
         pass
-    # attempt to close bot session/connection
     try:
         await bot.close()
     except:
@@ -576,8 +571,7 @@ async def restart_cmd(message):
                 await bot.session.close()
         except:
             pass
-    # final message and exec replace
-    await message.answer("Process will restart now.")
+    await message.answer("Restarted.")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 @dp.message(F.text)
