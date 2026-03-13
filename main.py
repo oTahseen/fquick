@@ -2,6 +2,7 @@ import asyncio
 import aiohttp
 import random
 import os
+import sys
 import uuid
 import sqlite3
 from datetime import datetime
@@ -540,6 +541,45 @@ async def history_cmd(message):
             await message.answer(f"Error clearing history: {e}")
         return
 
+@dp.message(Command("restart"))
+async def restart_cmd(message):
+    # Inform user we are restarting
+    await message.answer("Restarting bot: stopping tasks and restarting process...")
+    # Stop and cancel all matching tasks
+    for key, task in list(matching_tasks.items()):
+        try:
+            task.cancel()
+        except:
+            pass
+    matching_tasks.clear()
+    user_stats.clear()
+    # mark tasks as not running
+    for tid, meta in list(task_meta.items()):
+        try:
+            meta["running"] = False
+        except:
+            pass
+    task_meta.clear()
+    user_tokens.clear()
+    # attempt to close DB
+    try:
+        if sql_db:
+            await sql_db.close()
+    except:
+        pass
+    # attempt to close bot session/connection
+    try:
+        await bot.close()
+    except:
+        try:
+            if getattr(bot, "session", None):
+                await bot.session.close()
+        except:
+            pass
+    # final message and exec replace
+    await message.answer("Process will restart now.")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
 @dp.message(F.text)
 async def receive_token(message):
     if not message.text:
@@ -596,6 +636,7 @@ async def register_bot_commands():
         BotCommand(command="start", description="Start and send Meeff token"),
         BotCommand(command="countries", description="Manage countries filter"),
         BotCommand(command="history", description="Show history stats"),
+        BotCommand(command="restart", description="Restart the bot"),
     ]
     await bot.set_my_commands(commands)
 
