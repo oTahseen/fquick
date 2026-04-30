@@ -669,31 +669,39 @@ def get_mongo_db():
         return None
     if mongo_db:
         return mongo_db
-    mongo_client = MongoClient(MONGO_URI)
-    mongo_db = mongo_client[MONGO_DB_NAME]
-    return mongo_db
+    try:
+        mongo_client = MongoClient(MONGO_URI)
+        mongo_db = mongo_client[MONGO_DB_NAME]
+        return mongo_db
+    except Exception:
+        # don't raise here; callers will treat None as failure
+        mongo_client = None
+        mongo_db = None
+        return None
 
 
 async def fetch_tokens_from_mongo(user_id):
     """Return list of token dicts from the second bot's MongoDB for given user_id.
     This reads the same collections used by the provided db.py (tokens collection).
+    The function attempts to match both integer and string representations of user_id.
     """
     db = get_mongo_db()
     if not db:
         return []
     try:
+        # try exact match first
         docs = list(db.tokens.find({"user_id": user_id}, {"_id": 0, "token": 1, "name": 1, "active": 1, "email": 1}))
+        if docs:
+            return docs
+        # try string match (in case user_id stored as string)
+        docs = list(db.tokens.find({"user_id": str(user_id)}, {"_id": 0, "token": 1, "name": 1, "active": 1, "email": 1}))
+        if docs:
+            return docs
+        # fallback: try either int or string using $or
+        docs = list(db.tokens.find({"$or": [{"user_id": user_id}, {"user_id": str(user_id)}]}, {"_id": 0, "token": 1, "name": 1, "active": 1, "email": 1}))
         return docs
     except Exception:
         return []
-
-
-@dp.message(F.text)
-async def receive_token(message):
-    # Keep original token receiving behavior. This handler is defined later in file in original layout,
-    # but to avoid duplicate handler definitions we will only define the /sync handler below and keep
-    # the original receive_token handler further down unchanged.
-    pass
 
 
 @dp.message(Command("sync"))
@@ -705,15 +713,36 @@ async def sync_command(message):
     if not MONGO_URI:
         await message.reply("MongoDB is not configured. Set MONGO_URI environment variable to use /sync.")
         return
+    # quick feedback
+    try:
+        db = get_mongo_db()
+        if not db:
+            await message.reply("Failed to connect to MongoDB using MONGO_URI. Check configuration.")
+            return
+    except Exception as e:
+        await message.reply(f"MongoDB connection error: {e}")
+        return
+
     docs = await fetch_tokens_from_mongo(user_id)
     if not docs:
-        await message.reply("No tokens found for your account in the MongoDB database.")
-        return
+        # try again with string user_id explicitly and provide hint
+        docs_str = await fetch_tokens_from_mongo(str(user_id))
+        if docs_str:
+            docs = docs_str
+        else:
+            await message.reply("No tokens found for your account in the MongoDB database.\nIf your second bot stores user_id as a different type, let me know and I can try matching both types.")
+            return
     # prepare summary
     tokens = [d.get("token") for d in docs if d.get("token")]
     names = [d.get("name") or "(unnamed)" for d in docs]
     count = len(tokens)
-    display_names = "\n".join([f"{i+1}. {names[i]}" for i in range(len(names))])
+    # mask tokens for display (show only start+end)
+    def mask(t):
+        if not t:
+            return "(missing)"
+        return t[:6] + "..." + t[-6:]
+    display_lines = [f"{i+1}. {names[i]} - {mask(tokens[i])}" for i in range(len(tokens))]
+    display_names = "\n".join(display_lines)
     sync_id = uuid.uuid4().hex
     sync_meta[sync_id] = {"user_id": user_id, "tokens": tokens}
     kb = InlineKeyboardMarkup(inline_keyboard=[
