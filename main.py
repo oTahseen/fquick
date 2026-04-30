@@ -667,7 +667,8 @@ def get_mongo_db():
     global mongo_client, mongo_db
     if not MONGO_URI:
         return None
-    if mongo_db:
+    # compare against None explicitly because pymongo Database objects don't support truth testing
+    if mongo_db is not None:
         return mongo_db
     try:
         mongo_client = MongoClient(MONGO_URI)
@@ -686,7 +687,7 @@ async def fetch_tokens_from_mongo(user_id):
     The function attempts to match both integer and string representations of user_id.
     """
     db = get_mongo_db()
-    if not db:
+    if db is None:
         return []
     try:
         # try exact match first
@@ -716,7 +717,7 @@ async def sync_command(message):
     # quick feedback
     try:
         db = get_mongo_db()
-        if not db:
+        if db is None:
             await message.reply("Failed to connect to MongoDB using MONGO_URI. Check configuration.")
             return
     except Exception as e:
