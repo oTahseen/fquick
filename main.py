@@ -5,6 +5,7 @@ import os
 import sys
 import uuid
 import sqlite3
+import logging
 from datetime import datetime
 from pathlib import Path
 from aiogram import Bot, Dispatcher, F
@@ -20,10 +21,14 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import aiosqlite
 from dotenv import load_dotenv
 
-# added pymongo for read-only access to the second bot's database
+# optional: read-only access to the second bot's MongoDB
 from pymongo import MongoClient
+from bson import Int64
 
 load_dotenv()
+
+# basic logging to stdout for easier debugging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -416,145 +421,177 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
         pass
 
 
-@dp.callback_query(F.data.startswith("countries_mode_toggle:"))
-async def _countries_mode_toggle(callback: CallbackQuery):
-    parts = callback.data.split(":", 1)
-    if len(parts) < 2:
-        await callback.answer("Invalid data", show_alert=False)
-        return
+# helper: initialize mongo client lazily (read-only usage)
+def get_mongo_db():
+    global mongo_client, mongo_db
+    if not MONGO_URI:
+        logging.debug("get_mongo_db: MONGO_URI not set")
+        return None
+    # compare against None explicitly because pymongo Database objects don't support truth testing
+    if mongo_db is not None:
+        return mongo_db
     try:
-        chat_id = int(parts[1])
-    except:
-        await callback.answer("Invalid chat id", show_alert=False)
+        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        # ping to surface connection issues early
+        mongo_client.admin.command("ping")
+        mongo_db = mongo_client[MONGO_DB_NAME]
+        logging.info("Connected to MongoDB %s (db=%s)", MONGO_URI, MONGO_DB_NAME)
+        return mongo_db
+    except Exception as e:
+        logging.exception("Failed to connect to MongoDB: %s", e)
+        mongo_client = None
+        mongo_db = None
+        return None
+
+
+async def fetch_tokens_from_mongo(user_id):
+    """Return list of token dicts from the second bot's MongoDB for given user_id.
+    This reads the same collections used by the provided db.py (tokens collection).
+    The function attempts to match both integer and string representations of user_id.
+    """
+    db = get_mongo_db()
+    if db is None:
+        logging.debug("fetch_tokens_from_mongo: no db available")
+        return []
+    try:
+        # try several likely representations (int, Int64, string)
+        candidates = [user_id, str(user_id)]
+        try:
+            candidates.append(Int64(int(user_id)))
+        except Exception:
+            pass
+        # use $in to match whichever type is stored
+        docs = list(db.tokens.find({"user_id": {"$in": candidates}}, {"_id": 0, "token": 1, "name": 1, "active": 1, "email": 1}))
+        logging.info("fetch_tokens_from_mongo: user_id=%s -> found %d docs", user_id, len(docs))
+        return docs
+    except Exception as e:
+        logging.exception("Error fetching tokens for user_id=%s: %s", user_id, e)
+        return []
+
+
+@dp.message(Command("sync"))
+async def sync_command(message):
+    """Fetch Meeff tokens stored in the second bot's MongoDB for this Telegram user and ask for confirmation
+    to start requests on all found tokens.
+    """
+    user_id = message.chat.id
+    if not MONGO_URI:
+        await message.reply("MongoDB is not configured. Set MONGO_URI environment variable to use /sync.")
         return
-    current = (await get_config_value(f"countries_mode:{chat_id}")) or "exclude"
-    new = "include" if current == "exclude" else "exclude"
-    await set_config_value(f"countries_mode:{chat_id}", new)
-    enabled = await get_config_bool(f"countries_enabled:{chat_id}", default=True)
-    countries = await list_excluded_countries(chat_id)
-    state = "ON" if enabled else "OFF"
-    text = f"Countries ({new.upper()}) ({state}):\n" + (", ".join(countries) if countries else "No countries set.")
+
+    db = get_mongo_db()
+    if db is None:
+        await message.reply("Failed to connect to MongoDB using MONGO_URI. Check configuration.")
+        return
+
+    docs = await fetch_tokens_from_mongo(user_id)
+    if not docs:
+        # fallback: try string user id explicitly
+        docs = await fetch_tokens_from_mongo(str(user_id))
+        if not docs:
+            await message.reply(
+                "No tokens found for your account in the MongoDB database.\n"
+                "If your second bot stores user_id under a different field or type, let me know and I can try other matches."
+            )
+            return
+
+    # prepare summary
+    tokens = [d.get("token") for d in docs if d.get("token")]
+    names = [d.get("name") or "(unnamed)" for d in docs]
+    count = len(tokens)
+
+    # mask tokens for display (show only start+end)
+    def mask(t):
+        if not t:
+            return "(missing)"
+        return t[:6] + "..." + t[-6:]
+
+    display_lines = [f"{i+1}. {names[i]} - {mask(tokens[i])}" for i in range(len(tokens))]
+    display_names = "\n".join(display_lines)
+    sync_id = uuid.uuid4().hex
+    sync_meta[sync_id] = {"user_id": user_id, "tokens": tokens}
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{new.upper()}", callback_data=f"countries_mode_toggle:{chat_id}"),
-         InlineKeyboardButton(text=f"{'ON' if enabled else 'OFF'}", callback_data=f"countries_enabled_toggle:{chat_id}")],
-        [InlineKeyboardButton(text="Clear", callback_data=f"countries_clear:{chat_id}")]
+        [InlineKeyboardButton(text=f"Start ({count})", callback_data=f"sync_start:{sync_id}"),
+         InlineKeyboardButton(text="Cancel", callback_data=f"sync_cancel:{sync_id}")]
     ])
+    await message.reply(f"Found {count} account(s) in the shared DB:\n{display_names}\n\nStart sending requests on all these tokens?", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("sync_cancel:"))
+async def _sync_cancel(callback: CallbackQuery):
+    sid = callback.data.split(":", 1)[1]
+    meta = sync_meta.pop(sid, None)
     try:
-        await callback.message.edit_text(text, reply_markup=kb)
+        await callback.answer("Sync cancelled.", show_alert=False)
+        await callback.message.edit_text("Sync cancelled by user.")
     except:
         pass
-    await callback.answer(f"Mode set to {new}", show_alert=False)
 
 
-@dp.callback_query(F.data.startswith("countries_enabled_toggle:"))
-async def _countries_enabled_toggle(callback: CallbackQuery):
-    parts = callback.data.split(":", 1)
-    if len(parts) < 2:
-        await callback.answer("Invalid data", show_alert=False)
+@dp.callback_query(F.data.startswith("sync_start:"))
+async def _sync_start(callback: CallbackQuery):
+    sid = callback.data.split(":", 1)[1]
+    meta = sync_meta.pop(sid, None)
+    if not meta:
+        await callback.answer("Sync data expired or invalid.", show_alert=False)
         return
-    try:
-        chat_id = int(parts[1])
-    except:
-        await callback.answer("Invalid chat id", show_alert=False)
+    chat_id = meta.get("user_id")
+    tokens = meta.get("tokens", [])
+    explore_url = await get_config_value("explore_url")
+    if not explore_url:
+        await callback.answer("Explore URL not configured. Send the explore URL first.", show_alert=False)
         return
-    current = await get_config_bool(f"countries_enabled:{chat_id}", default=True)
-    new = not current
-    await set_config_bool(f"countries_enabled:{chat_id}", new)
-    mode = (await get_config_value(f"countries_mode:{chat_id}")) or "exclude"
-    countries = await list_excluded_countries(chat_id)
-    state = "ON" if new else "OFF"
-    text = f"Countries ({mode.upper()}) ({state}):\n" + (", ".join(countries) if countries else "No countries set.")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Mode: {mode.upper()}", callback_data=f"countries_mode_toggle:{chat_id}"),
-         InlineKeyboardButton(text=f"{'ON' if new else 'OFF'}", callback_data=f"countries_enabled_toggle:{chat_id}")],
-        [InlineKeyboardButton(text="Clear", callback_data=f"countries_clear:{chat_id}")]
-    ])
-    try:
-        await callback.message.edit_text(text, reply_markup=kb)
-    except:
-        pass
-    await callback.answer(f"Filter enabled set to {'ON' if new else 'OFF'}", show_alert=False)
-
-
-@dp.callback_query(F.data.startswith("countries_clear:"))
-async def _countries_clear(callback: CallbackQuery):
-    parts = callback.data.split(":", 1)
-    if len(parts) < 2:
-        await callback.answer("Invalid data", show_alert=False)
+    # start a matching task for each token (parallel)
+    started = 0
+    too_many = False
+    for token in tokens:
+        if not token:
+            continue
+        key = f"{chat_id}:{token}"
+        if key in matching_tasks:
+            continue
+        # register token in user_tokens
+        lst = user_tokens.get(chat_id, [])
+        if token not in lst:
+            lst.append(token)
+            user_tokens[chat_id] = lst
+        task_id = uuid.uuid4().hex
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Stop", callback_data=f"stop_task:{task_id}")]
+        ])
+        try:
+            stat_msg = await bot.send_message(
+                chat_id,
+                "Live Stats:\nRequests: 0\nCycles: 0\nErrors: 0",
+                reply_markup=keyboard,
+            )
+        except Exception:
+            # unable to send status message (maybe user blocked bot); skip starting this token
+            continue
+        task = asyncio.create_task(start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboard))
+        matching_tasks[key] = task
+        task_meta[task_id] = {"key": key, "stat_msg": stat_msg, "running": True, "token": token}
+        started += 1
+        # small delay to avoid burst creation
+        await asyncio.sleep(0.05)
+        if started >= 100:
+            too_many = True
+            break
+    if started == 0:
+        await callback.answer("No new tokens started (they may already be running).", show_alert=False)
+        try:
+            await callback.message.edit_text("No new tokens were started. They may already be running.")
+        except:
+            pass
         return
+    await callback.answer(f"Started {started} token(s).", show_alert=False)
     try:
-        chat_id = int(parts[1])
-    except:
-        await callback.answer("Invalid chat id", show_alert=False)
-        return
-    await clear_excluded_countries(chat_id)
-    await set_config_value(f"countries_mode:{chat_id}", "exclude")
-    await set_config_bool(f"countries_enabled:{chat_id}", True)
-    text = "Countries (EXCLUDE) (ON):\nNo countries set."
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Mode: EXCLUDE", callback_data=f"countries_mode_toggle:{chat_id}"),
-         InlineKeyboardButton(text="ON", callback_data=f"countries_enabled_toggle:{chat_id}")],
-        [InlineKeyboardButton(text="Clear", callback_data=f"countries_clear:{chat_id}")]
-    ])
-    try:
-        await callback.message.edit_text(text, reply_markup=kb)
-    except:
-        pass
-    await callback.answer("Cleared countries list.", show_alert=False)
-
-
-@dp.callback_query(F.data.startswith("hist_toggle:"))
-async def _hist_toggle(callback: CallbackQuery):
-    parts = callback.data.split(":", 1)
-    if len(parts) < 2:
-        await callback.answer("Invalid data", show_alert=False)
-        return
-    try:
-        chat_id = int(parts[1])
-    except:
-        await callback.answer("Invalid chat id", show_alert=False)
-        return
-    current = await get_config_bool(f"history_enabled:{chat_id}", default=True)
-    new = not current
-    await set_config_bool(f"history_enabled:{chat_id}", new)
-    count = await history_count_for_chat(chat_id)
-    state = "ON" if new else "OFF"
-    text = f"History ({state}):\nYour saved ids: {count}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{'ON' if new else 'OFF'}", callback_data=f"hist_toggle:{chat_id}"),
-         InlineKeyboardButton(text="Clear", callback_data=f"hist_clear:{chat_id}")]
-    ])
-    try:
-        await callback.message.edit_text(text, reply_markup=kb)
+        txt = f"Sync started. Started {started} token(s)."
+        if too_many:
+            txt += "\nStopped starting more after 100 tokens to avoid overload."
+        await callback.message.edit_text(txt)
     except:
         pass
-    await callback.answer(f"History dedupe set to {state}", show_alert=False)
-
-
-@dp.callback_query(F.data.startswith("hist_clear:"))
-async def _hist_clear(callback: CallbackQuery):
-    parts = callback.data.split(":", 1)
-    if len(parts) < 2:
-        await callback.answer("Invalid data", show_alert=False)
-        return
-    try:
-        chat_id = int(parts[1])
-    except:
-        await callback.answer("Invalid chat id", show_alert=False)
-        return
-    await clear_history_for_chat(chat_id)
-    await set_config_bool(f"history_enabled:{chat_id}", True)
-    count = await history_count_for_chat(chat_id)
-    text = f"History (ON):\nYour saved ids: {count}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="ON", callback_data=f"hist_toggle:{chat_id}"),
-         InlineKeyboardButton(text="Clear", callback_data=f"hist_clear:{chat_id}")]
-    ])
-    try:
-        await callback.message.edit_text(text, reply_markup=kb)
-    except:
-        pass
-    await callback.answer("Cleared history for this chat.", show_alert=False)
 
 
 @dp.message(F.text.startswith("https://api.meeff.com/user/explore"))
@@ -662,178 +699,8 @@ async def restart_cmd(message):
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
-# helper: initialize mongo client lazily
-def get_mongo_db():
-    global mongo_client, mongo_db
-    if not MONGO_URI:
-        return None
-    # compare against None explicitly because pymongo Database objects don't support truth testing
-    if mongo_db is not None:
-        return mongo_db
-    try:
-        mongo_client = MongoClient(MONGO_URI)
-        mongo_db = mongo_client[MONGO_DB_NAME]
-        return mongo_db
-    except Exception:
-        # don't raise here; callers will treat None as failure
-        mongo_client = None
-        mongo_db = None
-        return None
-
-
-async def fetch_tokens_from_mongo(user_id):
-    """Return list of token dicts from the second bot's MongoDB for given user_id.
-    This reads the same collections used by the provided db.py (tokens collection).
-    The function attempts to match both integer and string representations of user_id.
-    """
-    db = get_mongo_db()
-    if db is None:
-        return []
-    try:
-        # try exact match first
-        docs = list(db.tokens.find({"user_id": user_id}, {"_id": 0, "token": 1, "name": 1, "active": 1, "email": 1}))
-        if docs:
-            return docs
-        # try string match (in case user_id stored as string)
-        docs = list(db.tokens.find({"user_id": str(user_id)}, {"_id": 0, "token": 1, "name": 1, "active": 1, "email": 1}))
-        if docs:
-            return docs
-        # fallback: try either int or string using $or
-        docs = list(db.tokens.find({"$or": [{"user_id": user_id}, {"user_id": str(user_id)}]}, {"_id": 0, "token": 1, "name": 1, "active": 1, "email": 1}))
-        return docs
-    except Exception:
-        return []
-
-
-@dp.message(Command("sync"))
-async def sync_command(message):
-    """Fetch Meeff tokens stored in the second bot's MongoDB for this Telegram user and ask for confirmation
-    to start requests on all found tokens.
-    """
-    user_id = message.chat.id
-    if not MONGO_URI:
-        await message.reply("MongoDB is not configured. Set MONGO_URI environment variable to use /sync.")
-        return
-    # quick feedback
-    try:
-        db = get_mongo_db()
-        if db is None:
-            await message.reply("Failed to connect to MongoDB using MONGO_URI. Check configuration.")
-            return
-    except Exception as e:
-        await message.reply(f"MongoDB connection error: {e}")
-        return
-
-    docs = await fetch_tokens_from_mongo(user_id)
-    if not docs:
-        # try again with string user_id explicitly and provide hint
-        docs_str = await fetch_tokens_from_mongo(str(user_id))
-        if docs_str:
-            docs = docs_str
-        else:
-            await message.reply("No tokens found for your account in the MongoDB database.\nIf your second bot stores user_id as a different type, let me know and I can try matching both types.")
-            return
-    # prepare summary
-    tokens = [d.get("token") for d in docs if d.get("token")]
-    names = [d.get("name") or "(unnamed)" for d in docs]
-    count = len(tokens)
-    # mask tokens for display (show only start+end)
-    def mask(t):
-        if not t:
-            return "(missing)"
-        return t[:6] + "..." + t[-6:]
-    display_lines = [f"{i+1}. {names[i]} - {mask(tokens[i])}" for i in range(len(tokens))]
-    display_names = "\n".join(display_lines)
-    sync_id = uuid.uuid4().hex
-    sync_meta[sync_id] = {"user_id": user_id, "tokens": tokens}
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Start ({count})", callback_data=f"sync_start:{sync_id}"),
-         InlineKeyboardButton(text="Cancel", callback_data=f"sync_cancel:{sync_id}")]
-    ])
-    await message.reply(f"Found {count} account(s) in the shared DB:\n{display_names}\n\nStart sending requests on all these tokens?", reply_markup=kb)
-
-
-@dp.callback_query(F.data.startswith("sync_cancel:"))
-async def _sync_cancel(callback: CallbackQuery):
-    sid = callback.data.split(":", 1)[1]
-    meta = sync_meta.pop(sid, None)
-    try:
-        await callback.answer("Sync cancelled.", show_alert=False)
-        await callback.message.edit_text("Sync cancelled by user.")
-    except:
-        pass
-
-
-@dp.callback_query(F.data.startswith("sync_start:"))
-async def _sync_start(callback: CallbackQuery):
-    sid = callback.data.split(":", 1)[1]
-    meta = sync_meta.pop(sid, None)
-    if not meta:
-        await callback.answer("Sync data expired or invalid.", show_alert=False)
-        return
-    chat_id = meta.get("user_id")
-    tokens = meta.get("tokens", [])
-    explore_url = await get_config_value("explore_url")
-    if not explore_url:
-        await callback.answer("Explore URL not configured. Send the explore URL first.", show_alert=False)
-        return
-    # start a matching task for each token (parallel)
-    started = 0
-    too_many = False
-    for token in tokens:
-        if not token:
-            continue
-        key = f"{chat_id}:{token}"
-        if key in matching_tasks:
-            continue
-        # register token in user_tokens
-        lst = user_tokens.get(chat_id, [])
-        if token not in lst:
-            lst.append(token)
-            user_tokens[chat_id] = lst
-        task_id = uuid.uuid4().hex
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Stop", callback_data=f"stop_task:{task_id}")]
-        ])
-        try:
-            stat_msg = await bot.send_message(
-                chat_id,
-                "Live Stats:\nRequests: 0\nCycles: 0\nErrors: 0",
-                reply_markup=keyboard,
-            )
-        except Exception:
-            # unable to send status message (maybe user blocked bot); skip starting this token
-            continue
-        task = asyncio.create_task(start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboard))
-        matching_tasks[key] = task
-        task_meta[task_id] = {"key": key, "stat_msg": stat_msg, "running": True, "token": token}
-        started += 1
-        # small delay to avoid burst creation
-        await asyncio.sleep(0.05)
-        if started >= 100:
-            too_many = True
-            break
-    if started == 0:
-        await callback.answer("No new tokens started (they may already be running).", show_alert=False)
-        try:
-            await callback.message.edit_text("No new tokens were started. They may already be running.")
-        except:
-            pass
-        return
-    await callback.answer(f"Started {started} token(s).", show_alert=False)
-    try:
-        txt = f"Sync started. Started {started} token(s)."
-        if too_many:
-            txt += "\nStopped starting more after 100 tokens to avoid overload."
-        await callback.message.edit_text(txt)
-    except:
-        pass
-
-
 @dp.message(F.text)
-async def receive_token_original(message):
-    # This is the original receive_token handler from before. We re-add it under a different name
-    # because we had to declare a placeholder earlier.
+async def receive_token(message):
     if not message.text:
         return
     if message.text.startswith("/"):
